@@ -4,10 +4,149 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio
 from torch.utils.data import Dataset
 from torchvision import datasets, transforms
 from scipy.ndimage.interpolation import rotate as scipyrotate
-from networks import MLP, ConvNet, LeNet, AlexNet, AlexNetBN, VGG11, VGG11BN, ResNet18, ResNet18BN_AP, ResNet18BN
+from networks import MLP, ConvNet, LeNet, AlexNet, AlexNetBN, VGG11, VGG11BN, ResNet18, ResNet18BN_AP, ResNet18BN, MusicGenreCNN
+from PIL import Image
+
+
+class GTZANDataset(Dataset):
+    def __init__(self, root_dir: str, split: str = "train", sample_rate: int = 16000, feature_type: str = "melspectrogram", n_mels: int = 128, n_mfcc: int = 13, chunk_size: int = 128):
+        """
+        GTZAN Dataset with support for MelSpectrogram and MFCC feature extraction.
+
+        Args:
+            root_dir (str): Path to the 'data/raw' directory containing genre subfolders.
+            split (str): Dataset split. Options: "train" or "val".
+            sample_rate (int): Sampling rate for audio files.
+            feature_type (str): Type of feature to extract. Options: "melspectrogram" or "mfcc".
+            n_mels (int): Number of mel bands for MelSpectrogram.
+            n_mfcc (int): Number of MFCC features to extract.
+            chunk_size (int): Size of the feature map (chunk_size x chunk_size).
+        """
+        self.root_dir = root_dir
+        self.split = split
+        self.sample_rate = sample_rate
+        self.feature_type = feature_type.lower()
+        self.n_mels = n_mels
+        self.n_mfcc = n_mfcc
+        self.chunk_size = chunk_size
+
+        # Get genre labels from subfolder names (ignore non-directory files like .DS_Store)
+        self.genres = [genre for genre in sorted(os.listdir(root_dir)) if os.path.isdir(os.path.join(root_dir, genre))]
+        self.label_map = {genre: idx for idx, genre in enumerate(self.genres)}
+
+        # Collect all file paths and labels
+        self.file_paths = []
+        self.labels = []
+        for genre in self.genres:
+            genre_folder = os.path.join(root_dir, genre)
+            files = sorted(os.listdir(genre_folder))
+            
+            # Split files into train and val
+            if self.split == "train":
+                files = files[:int(0.8 * len(files))]  # First 80% for training
+            elif self.split == "val":
+                files = files[int(0.8 * len(files)):]  # Last 20% for validation
+            else:
+                raise ValueError("Invalid split. Choose 'train' or 'val'.")
+
+            for file in files:
+                if file.endswith(".wav"):
+                    self.file_paths.append(os.path.join(genre_folder, file))
+                    self.labels.append(self.label_map[genre])
+
+        # Define transforms
+        if self.feature_type == "melspectrogram":
+            self.transform = torchaudio.transforms.MelSpectrogram(
+                sample_rate=self.sample_rate,
+                n_mels=self.n_mels,
+                n_fft=2048,
+                hop_length=512
+            )
+        elif self.feature_type == "mfcc":
+            self.transform = torchaudio.transforms.MFCC(
+                sample_rate=self.sample_rate,
+                n_mfcc=self.n_mfcc,
+                melkwargs={"n_fft": 2048, "hop_length": 512, "n_mels": self.n_mels}
+            )
+        else:
+            raise ValueError("Invalid feature_type. Choose 'melspectrogram' or 'mfcc'.")
+
+    def __len__(self):
+        return len(self.file_paths)
+
+    def __getitem__(self, idx):
+        """Loads an audio file, extracts features, and returns a tensor."""
+        file_path = self.file_paths[idx]
+        label = self.labels[idx]
+
+        # Load audio file
+        waveform, sr = torchaudio.load(file_path)
+
+        # Resample if necessary
+        if sr != self.sample_rate:
+            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.sample_rate)
+            waveform = resampler(waveform)
+
+        # Convert stereo to mono if needed
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+        # Extract features
+        features = self.transform(waveform)
+
+        # Convert to log scale
+        features = torch.log(features + 1e-6)
+
+        # Split into chunks
+        chunks = self._split_into_chunks(features)
+        return chunks, torch.tensor(label, dtype=torch.long)
+
+    def _split_into_chunks(self, features):
+        """Splits the feature map into chunks of size chunk_size x chunk_size."""
+        n_frames = features.shape[2]
+        chunks = []
+        for i in range(0, n_frames, self.chunk_size):
+            if i + self.chunk_size <= n_frames:
+                chunk = features[:, :, i:i + self.chunk_size]
+                if chunk.shape[2] < self.chunk_size:
+                    # Pad the last chunk if necessary
+                    pad_size = self.chunk_size - chunk.shape[2]
+                    chunk = torch.nn.functional.pad(chunk, (0, pad_size))
+                chunks.append(chunk)
+        return torch.stack(chunks)
+# class GTZANDataset(Dataset):
+#     def __init__(self, data_path, transform=None):
+#         self.data_path = data_path
+#         self.transform = transform
+#         self.class_names = ['blues', 'classical', 'country', 'disco', 'hiphop', 'jazz', 'metal', 'pop', 'reggae', 'rock']
+#         self.file_paths = []
+#         self.labels = []
+
+#         # Load file paths and labels
+#         for label_idx, genre in enumerate(self.class_names):
+#             genre_path = os.path.join(data_path, genre)
+#             for file_name in os.listdir(genre_path):
+#                 if file_name.endswith('.png'):  # Assuming spectrograms are saved as PNG files
+#                     self.file_paths.append(os.path.join(genre_path, file_name))
+#                     self.labels.append(label_idx)
+
+#     def __len__(self):
+#         return len(self.file_paths)
+
+#     def __getitem__(self, idx):
+#         img_path = self.file_paths[idx]
+#         image = Image.open(img_path).convert('L')  # Convert to grayscale
+#         image = image.resize((32, 32))
+#         label = self.labels[idx]
+
+#         if self.transform:
+#             image = self.transform(image)
+
+#         return image, label
 
 def get_dataset(dataset, data_path):
     if dataset == 'MNIST':
@@ -93,14 +232,24 @@ def get_dataset(dataset, data_path):
 
         dst_test = TensorDataset(images_val, labels_val)  # no augmentation
 
+    elif dataset == 'GTZAN':
+        channel = 1  # Mel-Spectrogram is single-channel
+        # im_size = (128, 128)  # Adjust based on your Mel-Spectrogram dimensions
+        im_size = (128, 128)
+        num_classes = 10
+        mean = [0.5]
+        std = [0.5]
+
+        # Load GTZAN dataset manually
+        dst_train = GTZANDataset(root_dir=os.path.join(data_path, 'GTZAN'), split = 'train')
+        dst_test = GTZANDataset(root_dir=os.path.join(data_path, 'GTZAN'), split ='val')
+        class_names = ['blues', 'classical', 'country', 'disco', 'hiphop', 'jazz', 'metal', 'pop', 'reggae', 'rock']
+
     else:
         exit('unknown dataset: %s'%dataset)
 
-
     testloader = torch.utils.data.DataLoader(dst_test, batch_size=256, shuffle=False, num_workers=0)
     return channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test, testloader
-
-
 
 class TensorDataset(Dataset):
     def __init__(self, images, labels): # images: n x c x h x w tensor
@@ -192,6 +341,8 @@ def get_network(model, channel, num_classes, im_size=(32, 32)):
         net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=net_depth, net_act=net_act, net_norm=net_norm, net_pooling='maxpooling', im_size=im_size)
     elif model == 'ConvNetAP':
         net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=net_depth, net_act=net_act, net_norm=net_norm, net_pooling='avgpooling', im_size=im_size)
+    elif model == "MusicGenreCNN":
+        net = MusicGenreCNN(1, 10)
 
     else:
         net = None
@@ -303,18 +454,24 @@ def epoch(mode, dataloader, net, optimizer, criterion, args, aug):
         net.train()
     else:
         net.eval()
-
     for i_batch, datum in enumerate(dataloader):
         img = datum[0].float().to(args.device)
-        if aug:
-            if args.dsa:
-                img = DiffAugment(img, args.dsa_strategy, param=args.dsa_param)
-            else:
-                img = augment(img, args.dc_aug_param, device=args.device)
         lab = datum[1].long().to(args.device)
-        n_b = lab.shape[0]
+        if(len(img.shape) == 5):
+            batch_size, num_chunks, channels, height, width = img.shape
+            img = img.view(batch_size * num_chunks, channels, height, width)
+            lab = lab.repeat(num_chunks)
 
-        output = net(img)
+        # if aug:
+        #     if args.dsa:
+        #         img = DiffAugment(img, args.dsa_strategy, param=args.dsa_param)
+        #     else:
+        #         img = augment(img, args.dc_aug_param, device=args.device)
+        n_b = lab.shape[0]
+        try:
+            output = net(img)
+        except:
+            breakpoint()
         loss = criterion(output, lab)
         acc = np.sum(np.equal(np.argmax(output.cpu().data.numpy(), axis=-1), lab.cpu().data.numpy()))
 
@@ -346,7 +503,6 @@ def evaluate_synset(it_eval, net, images_train, labels_train, testloader, args):
 
     dst_train = TensorDataset(images_train, labels_train)
     trainloader = torch.utils.data.DataLoader(dst_train, batch_size=args.batch_train, shuffle=True, num_workers=0)
-
     start = time.time()
     for ep in range(Epoch+1):
         loss_train, acc_train = epoch('train', trainloader, net, optimizer, criterion, args, aug = True)

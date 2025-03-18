@@ -46,6 +46,8 @@ def main():
     eval_it_pool = np.arange(0, args.Iteration+1, 2000).tolist() if args.eval_mode == 'S' or args.eval_mode == 'SS' else [args.Iteration] # The list of iterations when we evaluate models and record results.
     print('eval_it_pool: ', eval_it_pool)
     channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test, testloader = get_dataset(args.dataset, args.data_path)
+    print('Hello world!')
+    breakpoint()
     model_eval_pool = get_eval_pool(args.eval_mode, args.model, args.model)
 
 
@@ -65,7 +67,7 @@ def main():
         images_all = []
         labels_all = []
         indices_class = [[] for c in range(num_classes)]
-
+        breakpoint()
         images_all = [torch.unsqueeze(dst_train[i][0], dim=0) for i in range(len(dst_train))]
         labels_all = [dst_train[i][1] for i in range(len(dst_train))]
         for i, lab in enumerate(labels_all):

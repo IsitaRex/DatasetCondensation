@@ -495,3 +495,50 @@ def ResNet101(channel, num_classes):
 def ResNet152(channel, num_classes):
     return ResNet(Bottleneck, [3,8,36,3], channel=channel, num_classes=num_classes)
 
+
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MusicGenreCNN(nn.Module):
+    def __init__(self, input_channels: int = 1, num_classes: int = 10):
+        super(MusicGenreCNN, self).__init__()
+        
+        # Convolutional layers
+        self.conv1 = nn.Conv2d(input_channels, 16, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
+        self.conv4 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        
+        # Max pooling layers
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2, return_indices=True)
+        
+        # Fully connected layers
+        self.fc1 = nn.Linear(128 * 8 * 8, 2048)
+        self.fc2 = nn.Linear(2048, 1024)
+        self.fc3 = nn.Linear(1024, num_classes)
+        
+        # Dropout
+        self.dropout = nn.Dropout(0.5)
+    
+    def forward(self, x):
+        # Convolutional layers
+        x = F.relu(self.conv1(x))
+        x, _ = self.pool(x)
+        x = F.relu(self.conv2(x))
+        x, _ = self.pool(x)
+        x = F.relu(self.conv3(x))
+        x, _ = self.pool(x)
+        x = F.relu(self.conv4(x))
+        x, _ = self.pool(x)
+        
+        # Flatten
+        x = x.view(x.size(0), -1)
+        
+        # Fully connected layers
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = F.relu(self.fc2(x))
+        x = self.dropout(x)
+        x = self.fc3(x)
+        
+        return x
