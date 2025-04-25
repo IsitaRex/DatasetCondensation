@@ -3,12 +3,15 @@ import time
 import copy
 import argparse
 import numpy as np
+import wandb
 import torch
 import torch.nn as nn
 from torchvision.utils import save_image
-import wandb
 from utils import get_loops, get_dataset, get_network, get_eval_pool, evaluate_synset, get_daparam, match_loss, get_time, TensorDataset, epoch, DiffAugment, ParamDiffAug
-USE_WANDB = True
+
+# Intentar importar wandb de manera segura
+#clear mps cache
+torch.mps.empty_cache()
 
 def main():
 
@@ -18,13 +21,13 @@ def main():
     parser.add_argument('--ipc', type=int, default=50, help='image(s) per class')
     parser.add_argument('--eval_mode', type=str, default='SS', help='eval_mode') # S: the same to training model, M: multi architectures,  W: net width, D: net depth, A: activation function, P: pooling layer, N: normalization layer,
     parser.add_argument('--num_exp', type=int, default=1, help='the number of experiments')
-    parser.add_argument('--num_eval', type=int, default=10, help='the number of evaluating randomly initialized models')
-    parser.add_argument('--epoch_eval_train', type=int, default=1000, help='epochs to train a model with synthetic data') # it can be small for speeding up with little performance drop
-    parser.add_argument('--Iteration', type=int, default=2000, help='training iterations')
-    parser.add_argument('--lr_img', type=float, default=1.0, help='learning rate for updating synthetic images')
+    parser.add_argument('--num_eval', type=int, default=5, help='the number of evaluating randomly initialized models')
+    parser.add_argument('--epoch_eval_train', type=int, default=2000, help='epochs to train a model with synthetic data') # it can be small for speeding up with little performance drop
+    parser.add_argument('--Iteration', type=int, default=3000, help='training iterations')
+    parser.add_argument('--lr_img', type=float, default=2.0, help='learning rate for updating synthetic images')
     parser.add_argument('--lr_net', type=float, default=0.01, help='learning rate for updating network parameters')
-    parser.add_argument('--batch_real', type=int, default=256, help='batch size for real data')
-    parser.add_argument('--batch_train', type=int, default=256, help='batch size for training networks')
+    parser.add_argument('--batch_real', type=int, default=32, help='batch size for real data')
+    parser.add_argument('--batch_train', type=int, default=32, help='batch size for training networks')
     parser.add_argument('--init', type=str, default='noise', help='noise/real: initialize synthetic images from random noise or randomly sampled real images.')
     parser.add_argument('--dsa_strategy', type=str, default='color_crop_cutout_flip_scale_rotate', help='differentiable Siamese augmentation strategy')
     parser.add_argument('--data_path', type=str, default='data', help='dataset path')
@@ -39,6 +42,7 @@ def main():
     args.dsa_param = ParamDiffAug()
     # args.dsa = False if args.dsa_strategy in ['none', 'None'] else True
     args.dsa = False
+    USE_WANDB = True
 
     if not os.path.exists(args.data_path):
         os.mkdir(args.data_path)
@@ -46,6 +50,7 @@ def main():
     if not os.path.exists(args.save_path):
         os.mkdir(args.save_path)
 
+    # Inicializar wandb solo si está disponible y funcionando
     if USE_WANDB:
         wandb.init(project=f"Replication-Dataset-Condensation-{args.dataset}", config={
             "ipc": args.ipc,
@@ -54,12 +59,11 @@ def main():
             "lr_img": args.lr_img,
             "lr_net": args.lr_net,
             "model": args.model
-    })
+        })
 
     eval_it_pool = np.arange(0, args.Iteration+1, 500).tolist() if args.eval_mode == 'S' or args.eval_mode == 'SS' else [args.Iteration] # The list of iterations when we evaluate models and record results.
     channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test, testloader = get_dataset(args.dataset, args.data_path)
     model_eval_pool = get_eval_pool(args.eval_mode, args.model, args.model)
-
 
     accs_all_exps = dict() # record performances of all experiments
     for key in model_eval_pool:
@@ -133,6 +137,23 @@ def main():
                         _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args)
                         accs.append(acc_test)
                         accs_train.append(acc_train)
+                        
+                        # Liberar memoria explícitamente
+                        del net_eval
+                        del image_syn_eval
+                        del label_syn_eval
+                        
+                        # Limpiar la memoria caché si estás usando MPS (Apple Silicon)
+                        if args.device == 'mps':
+                            torch.mps.empty_cache()
+                        # Limpiar la memoria caché si estás usando CUDA
+                        elif args.device == 'cuda':
+                            torch.cuda.empty_cache()
+                        
+                        # Llamar al recolector de basura de Python
+                        import gc
+                        gc.collect()
+                        
                     print('Evaluate %d random %s, mean = %.4f std = %.4f\n-------------------------'%(len(accs), model_eval, np.mean(accs), np.std(accs)))
                     if USE_WANDB:
                         wandb.log({f"exp_{exp}": {
@@ -209,7 +230,8 @@ def main():
             loss.backward()
             optimizer_img.step()
             loss_avg += loss.item()
-
+            
+            
 
             loss_avg /= (num_classes)
             
@@ -217,6 +239,7 @@ def main():
                 wandb.log({f"exp_{exp}": {
                     'Synthetic data loss': loss_avg
                 }})
+
             if it%10 == 0:
                 print('%s iter = %05d, loss = %.4f' % (get_time(), it, loss_avg))
 
@@ -224,6 +247,20 @@ def main():
                 data_save.append([copy.deepcopy(image_syn.detach().cpu()), copy.deepcopy(label_syn.detach().cpu())])
                 torch.save({'data': data_save, 'accs_all_exps': accs_all_exps, }, os.path.join(args.save_path, 'res_%s_%s_%s_%dipc.pt'%(args.method, args.dataset, args.model, args.ipc)))
 
+            # Liberar memoria explícitamente
+            del net
+            del embed
+            
+            # Limpiar la memoria caché si estás usando MPS (Apple Silicon)
+            if args.device == 'mps':
+                torch.mps.empty_cache()
+            # Limpiar la memoria caché si estás usando CUDA
+            elif args.device == 'cuda':
+                torch.cuda.empty_cache()
+
+    # Finalizar wandb de forma segura al terminar
+    if USE_WANDB:
+        wandb.finish()
 
     print('\n==================== Final Results ====================\n')
     for key in model_eval_pool:
