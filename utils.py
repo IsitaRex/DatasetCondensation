@@ -76,10 +76,12 @@ class GTZANDataset(Dataset):
             raise ValueError("Invalid feature_type. Choose 'melspectrogram' or 'mfcc'.")
 
     def __len__(self):
-        return len(self.file_paths)
+        return len(self.file_paths)*7
 
     def __getitem__(self, idx):
         """Loads an audio file, extracts features, and returns a tensor."""
+        chunk_idx = idx%7
+        idx = idx//7
         file_path = self.file_paths[idx]
         label = self.labels[idx]
 
@@ -103,7 +105,8 @@ class GTZANDataset(Dataset):
 
         # Split into chunks
         chunks = self._split_into_chunks(features)
-        return chunks, torch.tensor(label, dtype=torch.long)
+        
+        return chunks[chunk_idx], torch.tensor(label, dtype=torch.long)
 
     def _split_into_chunks(self, features):
         """Splits the feature map into chunks of size chunk_size x chunk_size."""
@@ -234,7 +237,6 @@ def get_dataset(dataset, data_path):
 
     elif dataset == 'GTZAN':
         channel = 1  # Mel-Spectrogram is single-channel
-        # im_size = (128, 128)  # Adjust based on your Mel-Spectrogram dimensions
         im_size = (128, 128)
         num_classes = 10
         mean = [0.5]
@@ -468,10 +470,7 @@ def epoch(mode, dataloader, net, optimizer, criterion, args, aug):
         #     else:
         #         img = augment(img, args.dc_aug_param, device=args.device)
         n_b = lab.shape[0]
-        try:
-            output = net(img)
-        except:
-            breakpoint()
+        output = net(img)
         loss = criterion(output, lab)
         acc = np.sum(np.equal(np.argmax(output.cpu().data.numpy(), axis=-1), lab.cpu().data.numpy()))
 
