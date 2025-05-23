@@ -9,8 +9,9 @@ from torch.utils.data import Dataset
 from torchvision import datasets, transforms
 from scipy.ndimage.interpolation import rotate as scipyrotate
 from networks import MLP, ConvNet, LeNet, AlexNet, AlexNetBN, VGG11, VGG11BN, ResNet18, ResNet18BN_AP, ResNet18BN, MusicGenreCNN
+from representations.EmbeddingsDataset import EmbeddingsDataset
 from PIL import Image
-
+from representations.utils import load_AST
 
 class GTZANDataset(Dataset):
     def __init__(self, root_dir: str, split: str = "train", sample_rate: int = 16000, feature_type: str = "melspectrogram", n_mels: int = 128, n_mfcc: int = 13, chunk_size: int = 128):
@@ -121,36 +122,52 @@ class GTZANDataset(Dataset):
                     chunk = torch.nn.functional.pad(chunk, (0, pad_size))
                 chunks.append(chunk)
         return torch.stack(chunks)
-# class GTZANDataset(Dataset):
-#     def __init__(self, data_path, transform=None):
-#         self.data_path = data_path
-#         self.transform = transform
-#         self.class_names = ['blues', 'classical', 'country', 'disco', 'hiphop', 'jazz', 'metal', 'pop', 'reggae', 'rock']
-#         self.file_paths = []
-#         self.labels = []
 
-#         # Load file paths and labels
-#         for label_idx, genre in enumerate(self.class_names):
-#             genre_path = os.path.join(data_path, genre)
-#             for file_name in os.listdir(genre_path):
-#                 if file_name.endswith('.png'):  # Assuming spectrograms are saved as PNG files
-#                     self.file_paths.append(os.path.join(genre_path, file_name))
-#                     self.labels.append(label_idx)
+class AudioMNISTDataset(Dataset):
+    def __init__(self, root_dir: str, split="train", train_size=0.80, sample_rate=16000):
+        self.root_dir = root_dir
+        self.file_list = []
+        self.label_list = []
+        self.sample_rate = sample_rate
+        for dirname, _, filenames in os.walk(root_dir):
+            for filename in filenames:
+                if filename[-3:] != "txt":
+                    self.file_list.append(os.path.join(dirname, filename))
+                    self.label_list.append(int(filename[0]))
+        
+        self.transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=self.sample_rate,
+        )
+        
+        total_len = len(self.file_list)
+        
+        if split == 'train':
+            self.file_list, self.label_list = self.file_list[:int(train_size * total_len)], self.label_list[:int(train_size * total_len)]
+        elif split == 'val':
+            self.file_list, self.label_list = self.file_list[int(train_size * total_len):], self.label_list[int(train_size * total_len):]
+                    
+    def __getitem__(self, idx):
+        waveform, sr = torchaudio.load(self.file_list[idx])
+        if sr != self.sample_rate:
+            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.sample_rate)
+            waveform = resampler(waveform)
 
-#     def __len__(self):
-#         return len(self.file_paths)
-
-#     def __getitem__(self, idx):
-#         img_path = self.file_paths[idx]
-#         image = Image.open(img_path).convert('L')  # Convert to grayscale
-#         image = image.resize((32, 32))
-#         label = self.labels[idx]
-
-#         if self.transform:
-#             image = self.transform(image)
-
-#         return image, label
-
+        features = self.transform(waveform)
+        
+        # Current shape is [n_mels, time], we want [128, 128]
+        _, n_mels, time = features.shape
+        
+        # Option 1: Truncate or pad time dimension to 128
+        if time < 128:
+            # Pad with zeros
+            pad = torch.zeros((1, n_mels, 128 - time))
+            features = torch.cat([features, pad], dim=2)
+        
+        return features, self.label_list[idx]
+    
+    def __len__(self):
+        return len(self.file_list)
+    
 def get_dataset(dataset, data_path):
     if dataset == 'MNIST':
         channel = 1
@@ -246,6 +263,41 @@ def get_dataset(dataset, data_path):
         dst_train = GTZANDataset(root_dir=os.path.join(data_path, 'GTZAN'), split = 'train')
         dst_test = GTZANDataset(root_dir=os.path.join(data_path, 'GTZAN'), split ='val')
         class_names = ['blues', 'classical', 'country', 'disco', 'hiphop', 'jazz', 'metal', 'pop', 'reggae', 'rock']
+    
+    elif dataset == 'AUDIO_MNIST':
+        channel = 1
+        im_size = (128, 128)
+        num_classes = 10
+        mean = [0.5]
+        std = [0.5]
+        # Load GTZAN dataset manually
+        dst_train = AudioMNISTDataset(root_dir=os.path.join(data_path, 'AUDIO_MNIST'), split = 'train')
+        dst_test = AudioMNISTDataset(root_dir=os.path.join(data_path, 'AUDIO_MNIST'), split ='val')
+        class_names = [str(i) for i in range(num_classes)]
+    
+    elif dataset == "EmbeddingsDataset_GTZAN":
+        channel = 1
+        im_size = (128, 128)
+        num_classes = 10
+        mean = [0.5]
+        std = [0.5]
+
+        # Load GTZAN dataset manually
+        dst_train = EmbeddingsDataset(root_dir="data", dataset_name="GTZAN", split="train")
+        dst_test = GTZANDataset(root_dir=os.path.join(data_path, 'GTZAN'), split ='val')
+        class_names = ['blues', 'classical', 'country', 'disco', 'hiphop', 'jazz', 'metal', 'pop', 'reggae', 'rock']
+    
+    elif dataset == "EmbeddingsDataset_AUDIO_MNIST":
+        channel = 1
+        im_size = (128, 128)
+        num_classes = 10
+        mean = [0.5]
+        std = [0.5]
+
+        # Load GTZAN dataset manually
+        dst_train = EmbeddingsDataset(root_dir="data", dataset_name="AUDIO_MNIST", split="train")
+        dst_test = AudioMNISTDataset(root_dir=os.path.join(data_path, 'AUDIO_MNIST'), split ='val')
+        class_names = [str(i) for i in range(num_classes)]
 
     else:
         exit('unknown dataset: %s'%dataset)
@@ -345,6 +397,8 @@ def get_network(model, channel, num_classes, im_size=(32, 32)):
         net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=net_depth, net_act=net_act, net_norm=net_norm, net_pooling='avgpooling', im_size=im_size)
     elif model == "MusicGenreCNN":
         net = MusicGenreCNN(1, 10)
+    elif model == 'AST':
+        net = load_AST()
 
     else:
         net = None
@@ -804,3 +858,81 @@ AUGMENT_FNS = {
     'rotate': [rand_rotate],
 }
 
+def sample_negative_samples(class_id, num_samples, class_indices, all_real_data):
+    """
+    Randomly sample data points from classes other than the specified class_id.
+
+    Args:
+        class_id (int): The class ID to exclude.
+        num_samples (int): The number of samples to retrieve.
+        class_indices (dict): A dictionary where keys are class IDs and values are lists of indices for each class.
+        all_real_data (np.ndarray): The dataset containing all data points.
+
+    Returns:
+        np.ndarray: An array of sampled data points from other classes.
+    """
+    # Collect indices from all classes except the specified class_id
+    negative_indices = [idx for cls, indices in enumerate(class_indices) if cls != class_id for idx in indices]
+    
+    # Randomly sample the required number of indices
+    sampled_indices = np.random.choice(negative_indices, size=num_samples, replace=False)
+    
+    # Return the sampled data points
+    return all_real_data[sampled_indices]
+
+
+def info_nce_loss(anchor, positive, negatives, device, temperature=0.1):
+    """
+    Compute the InfoNCE loss.
+
+    Args:
+        anchor (torch.Tensor): Anchor embeddings of shape (batch_size, embedding_dim).
+        positive (torch.Tensor): Positive embeddings of shape (batch_size, embedding_dim).
+        negatives (torch.Tensor): Negative embeddings of shape (num_negatives, embedding_dim).
+        device (torch.device): The device to use (e.g., torch.device('cuda') or 'cpu').
+        temperature (float): Temperature scaling factor.
+
+    Returns:
+        torch.Tensor: The computed InfoNCE loss.
+    """
+    batch_size = anchor.shape[0]
+    embedding_dim = anchor.shape[1]
+    num_negatives = negatives.shape[0]
+
+    # Normalize all embeddings
+    anchor = F.normalize(anchor, dim=1)
+    positive = F.normalize(positive, dim=1)
+    negatives = F.normalize(negatives, dim=1)
+
+    # Compute similarity between anchor and positive: (batch_size,)
+    pos_sim = torch.sum(anchor * positive, dim=1, keepdim=True)  # shape: (batch_size, 1)
+
+    # Compute similarity between anchor and each negative
+    # anchor: (batch_size, embedding_dim)
+    # negatives.T: (embedding_dim, num_negatives)
+    neg_sim = anchor @ negatives.T  # shape: (batch_size, num_negatives)
+
+    # Concatenate positive and negative similarities: (batch_size, 1 + num_negatives)
+    logits = torch.cat([pos_sim, neg_sim], dim=1)
+
+    # Scale by temperature
+    logits /= temperature
+
+    # Create labels: positive is at index 0
+    labels = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+    # Compute cross-entropy loss
+    loss = F.cross_entropy(logits, labels)
+
+    return loss
+
+if __name__ == '__main__':
+    
+    # test Audio MNIST dataset
+    dataset = AudioMNISTDataset(root_dir=os.path.join("data", 'AUDIO_MNIST'), split='train', train_size = 0.1)
+    max_len = 0
+    for i in range(len(dataset)):
+        data = dataset[i]
+        max_len = max(max_len, data[0].shape[2])
+    breakpoint()
+    print(len(dataset))

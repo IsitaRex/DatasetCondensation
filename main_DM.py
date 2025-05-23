@@ -1,13 +1,14 @@
 import os
 import time
 import copy
+import gc
 import argparse
 import numpy as np
 import wandb
 import torch
 import torch.nn as nn
 from torchvision.utils import save_image
-from utils import get_loops, get_dataset, get_network, get_eval_pool, evaluate_synset, get_daparam, match_loss, get_time, TensorDataset, epoch, DiffAugment, ParamDiffAug
+from utils import get_loops, get_dataset, get_network, get_eval_pool, evaluate_synset, get_daparam, match_loss, get_time, TensorDataset, epoch, DiffAugment, ParamDiffAug, info_nce_loss
 
 # Intentar importar wandb de manera segura
 #clear mps cache
@@ -18,21 +19,23 @@ def main():
     parser = argparse.ArgumentParser(description='Parameter Processing')
     parser.add_argument('--dataset', type=str, default='CIFAR10', help='dataset')
     parser.add_argument('--model', type=str, default='ConvNet', help='model')
-    parser.add_argument('--ipc', type=int, default=50, help='image(s) per class')
+    parser.add_argument('--ipc', type=int, default=10, help='image(s) per class')
     parser.add_argument('--eval_mode', type=str, default='SS', help='eval_mode') # S: the same to training model, M: multi architectures,  W: net width, D: net depth, A: activation function, P: pooling layer, N: normalization layer,
     parser.add_argument('--num_exp', type=int, default=1, help='the number of experiments')
-    parser.add_argument('--num_eval', type=int, default=5, help='the number of evaluating randomly initialized models')
-    parser.add_argument('--epoch_eval_train', type=int, default=2000, help='epochs to train a model with synthetic data') # it can be small for speeding up with little performance drop
-    parser.add_argument('--Iteration', type=int, default=3000, help='training iterations')
+    parser.add_argument('--num_eval', type=int, default=3, help='the number of evaluating randomly initialized models')
+    parser.add_argument('--epoch_eval_train', type=int, default=100, help='epochs to train a model with synthetic data') # it can be small for speeding up with little performance drop
+    parser.add_argument('--Iteration', type=int, default=2000, help='training iterations')
     parser.add_argument('--lr_img', type=float, default=2.0, help='learning rate for updating synthetic images')
-    parser.add_argument('--lr_net', type=float, default=0.01, help='learning rate for updating network parameters')
-    parser.add_argument('--batch_real', type=int, default=32, help='batch size for real data')
-    parser.add_argument('--batch_train', type=int, default=32, help='batch size for training networks')
+    parser.add_argument('--lr_net', type=float, default=0.1, help='learning rate for updating network parameters')
+    parser.add_argument('--batch_real', type=int, default=64, help='batch size for real data')
+    parser.add_argument('--batch_train', type=int, default=64, help='batch size for training networks')
     parser.add_argument('--init', type=str, default='noise', help='noise/real: initialize synthetic images from random noise or randomly sampled real images.')
     parser.add_argument('--dsa_strategy', type=str, default='color_crop_cutout_flip_scale_rotate', help='differentiable Siamese augmentation strategy')
     parser.add_argument('--data_path', type=str, default='data', help='dataset path')
     parser.add_argument('--save_path', type=str, default='result', help='path to save results')
-    parser.add_argument('--dis_metric', type=str, default='ours', help='distance metric')
+    parser.add_argument('--use_wandb', type=bool, default=True, help='Use wandb for logging')
+    parser.add_argument('--use_contrastive', type=bool, default=False, help='Use contrastive loss')
+    parser.add_argument('--contrastive_weight', type=float, default=0.2, help='Weight for contrastive loss')
 
     args = parser.parse_args()
     args.method = 'DM'
@@ -42,7 +45,7 @@ def main():
     args.dsa_param = ParamDiffAug()
     # args.dsa = False if args.dsa_strategy in ['none', 'None'] else True
     args.dsa = False
-    USE_WANDB = True
+    USE_WANDB = args.use_wandb
 
     if not os.path.exists(args.data_path):
         os.mkdir(args.data_path)
@@ -58,7 +61,12 @@ def main():
             "batch_size_train": args.batch_train,
             "lr_img": args.lr_img,
             "lr_net": args.lr_net,
-            "model": args.model
+            "model": args.model,
+            "epoch_eval_train": args.epoch_eval_train,
+            "num_eval": args.num_eval,
+            "Iteration": args.Iteration,
+            "use_contrastive": args.use_contrastive,
+            "contrastive_weight": args.contrastive_weight
         })
 
     eval_it_pool = np.arange(0, args.Iteration+1, 500).tolist() if args.eval_mode == 'S' or args.eval_mode == 'SS' else [args.Iteration] # The list of iterations when we evaluate models and record results.
@@ -70,7 +78,8 @@ def main():
         accs_all_exps[key] = []
 
     data_save = []
-
+    if args.dataset.startswith("EmbeddingsDataset"):
+        args.model = "AST"
 
     for exp in range(args.num_exp):
         print('\n================== Exp %d ==================\n '%exp)
@@ -90,13 +99,20 @@ def main():
         labels_all = torch.tensor(labels_all, dtype=torch.long, device=args.device)
 
 
-
         for c in range(num_classes):
             print('class c = %d: %d real images'%(c, len(indices_class[c])))
 
         def get_images(c, n): # get random n images from class c
             idx_shuffle = np.random.permutation(indices_class[c])[:n]
             return images_all[idx_shuffle]
+        
+        def sample_negative_samples(class_id, num_samples):
+            # Collect indices from all classes except the specified class_id
+            negative_indices = [idx for cls, indices in enumerate(indices_class) if cls != class_id for idx in indices]
+            # Randomly sample the required number of indices
+            sampled_indices = np.random.choice(negative_indices, size=num_samples, replace=False)
+            # Return the sampled data points
+            return images_all[sampled_indices]
 
         for ch in range(channel):
             print('real images channel %d, mean = %.4f, std = %.4f'%(ch, torch.mean(images_all[:, ch]), torch.std(images_all[:, ch])))
@@ -138,21 +154,18 @@ def main():
                         accs.append(acc_test)
                         accs_train.append(acc_train)
                         
-                        # Liberar memoria explícitamente
+                        # Memory cleanup
                         del net_eval
                         del image_syn_eval
                         del label_syn_eval
                         
-                        # Limpiar la memoria caché si estás usando MPS (Apple Silicon)
                         if args.device == 'mps':
                             torch.mps.empty_cache()
-                        # Limpiar la memoria caché si estás usando CUDA
                         elif args.device == 'cuda':
                             torch.cuda.empty_cache()
                         
-                        # Llamar al recolector de basura de Python
-                        import gc
                         gc.collect()
+                        # End of memory cleanup
                         
                     print('Evaluate %d random %s, mean = %.4f std = %.4f\n-------------------------'%(len(accs), model_eval, np.mean(accs), np.std(accs)))
                     if USE_WANDB:
@@ -180,8 +193,11 @@ def main():
             net.train()
             for param in list(net.parameters()):
                 param.requires_grad = False
-
-            embed = net.module.embed if torch.cuda.device_count() > 1 else net.embed # for GPU parallel
+            
+            if args.model == 'ConvNet':
+                embed = net.module.embed if torch.cuda.device_count() > 1 else net.embed # for GPU parallel
+            else:
+                embed = net
 
             loss_avg = 0
 
@@ -190,16 +206,30 @@ def main():
                 loss = torch.tensor(0.0).to(args.device)
                 for c in range(num_classes):
                     img_real = get_images(c, args.batch_real)
+                    
+                    if args.use_contrastive:
+                        img_real = get_images(c, args.ipc)
+                    
                     img_syn = image_syn[c*args.ipc:(c+1)*args.ipc].reshape((args.ipc, channel, im_size[0], im_size[1]))
                     if args.dsa:
                         seed = int(time.time() * 1000) % 100000
                         img_real = DiffAugment(img_real, args.dsa_strategy, seed=seed, param=args.dsa_param)
                         img_syn = DiffAugment(img_syn, args.dsa_strategy, seed=seed, param=args.dsa_param)
-                
-                    output_real = embed(img_real).detach()
-                    output_syn = embed(img_syn)
+                    
+                    if args.model == "AST":
+                        output_real = img_real.detach()
+                        output_syn = embed(img_syn.squeeze(1)).pooler_output
+                    else:
+                        output_real = embed(img_real).detach()
+                        output_syn = embed(img_syn)
 
-                    loss += torch.sum((torch.mean(output_real, dim=0) - torch.mean(output_syn, dim=0))**2)
+                    if args.use_contrastive:
+                        negative_samples = sample_negative_samples(c, args.ipc)
+                        output_neg = embed(negative_samples)
+                        loss += args.contrastive_weight*info_nce_loss(output_real, output_syn, output_neg, args.ipc)
+                        loss += (1 - args.contrastive_weight)*torch.sum((torch.mean(output_real, dim=0) - torch.mean(output_syn, dim=0))**2)
+                    else:
+                        loss += torch.sum((torch.mean(output_real, dim=0) - torch.mean(output_syn, dim=0))**2)
 
 
             else: # for ConvNetBN
@@ -247,16 +277,17 @@ def main():
                 data_save.append([copy.deepcopy(image_syn.detach().cpu()), copy.deepcopy(label_syn.detach().cpu())])
                 torch.save({'data': data_save, 'accs_all_exps': accs_all_exps, }, os.path.join(args.save_path, 'res_%s_%s_%s_%dipc.pt'%(args.method, args.dataset, args.model, args.ipc)))
 
-            # Liberar memoria explícitamente
+            # Memory cleanup
             del net
             del embed
             
-            # Limpiar la memoria caché si estás usando MPS (Apple Silicon)
             if args.device == 'mps':
                 torch.mps.empty_cache()
-            # Limpiar la memoria caché si estás usando CUDA
             elif args.device == 'cuda':
                 torch.cuda.empty_cache()
+
+            gc.collect()
+            # End of memory cleanup
 
     # Finalizar wandb de forma segura al terminar
     if USE_WANDB:
